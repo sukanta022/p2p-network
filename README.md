@@ -4,7 +4,8 @@ CSE 433 (Blockchain & Distributed Security Lab), University of Asia Pacific.
 
 A lightweight peer-to-peer application in Python. Every peer is both a TCP server
 and a TCP client; there is no central server. Peers exchange text messages and
-binary files (images, audio, video, PDF, ZIP...) directly over TCP.
+binary files (images, audio, video, PDF, ZIP...) directly over TCP, on one
+computer or across a local network (LAN / Wi-Fi), with a Tkinter GUI.
 
 ## Requirements
 - Python 3.9+ (with tkinter)
@@ -17,6 +18,33 @@ binary files (images, audio, video, PDF, ZIP...) directly over TCP.
 | `p2p_node.py` | Networking: TCP server, client connections, handshake, threads, text and file transfer |
 | `protocol.py` | Message framing, JSON encoding/decoding, file chunk helpers |
 | `downloads/` | Received files are saved here |
+
+## How to Run the GUI
+```
+python main.py
+```
+1. **My Peer:** enter a name and a port (e.g. 5000) and press **Start Peer**. The status line shows your peer ID and your LAN IP.
+2. **Connect to Peer:** enter the other peer's IP and port and press **Connect**. Use `127.0.0.1` for a peer on the same computer.
+3. The peer appears in **Connected Peers**. Select it to choose who receives your messages and files.
+4. **Send Text:** type a message and press **Send** (or Enter). Tick **Send to all peers** to send to everyone.
+5. **Send File:** press **Choose File & Send**. A progress bar shows the transfer. Received files are saved in `downloads/` (**Open Downloads Folder** opens it).
+6. Press **Stop** to shut the peer down.
+
+### Two peers on one computer
+Run `python main.py` twice. Start the first as `Alice` / `5000` and the second as `Bob` / `5001`, then connect Bob to `127.0.0.1` port `5000`.
+
+### Two computers on the same Wi-Fi / LAN
+Start a peer on each computer. On the second computer connect to the first computer's IP (shown in its status line) and port. If the connection times out, allow Python through the firewall for **private networks**.
+
+## GUI Layout
+| Section | Purpose |
+|---------|---------|
+| My Peer | Name, port, Start / Stop |
+| Connect to Peer | Remote IP, remote port, Connect |
+| Connected Peers | Active peers (name, ID, address); Disconnect button |
+| Communication / Event Log | Status events, incoming and outgoing messages, file notices |
+| Send Text | Message box, Send, "Send to all peers" |
+| Send File | Choose file and send, progress bar, open downloads folder |
 
 ## Architecture
 ```
@@ -36,11 +64,12 @@ User Interface (main.py)
 ## Concurrency Model
 | Thread | Purpose |
 |--------|---------|
-| GUI / main thread | Tkinter event loop, never blocks on network I/O |
+| GUI / main thread | Tkinter event loop; never blocks on network I/O |
 | Accept thread | `accept()` loop on the listening socket |
 | Handshake thread (per incoming connection) | Runs hello/hello_ack, then becomes the receive thread |
 | Receive thread (per peer) | Blocking `recv` loop for one peer; also receives file bytes |
 | File sender thread (per transfer) | Sends one file so the GUI never freezes |
+| Connect / send worker threads | Blocking connect and text sends triggered from the GUI |
 
 - Shared state (`peers` dict) is protected by a `threading.Lock`.
 - Each peer has its own `send_lock`. It is held for a whole message, and for a whole
@@ -48,6 +77,9 @@ User Interface (main.py)
 - If two peers connect to each other at the same time, the connection initiated by
   the peer with the lower `peer_id` is kept; both sides apply the same rule.
 - Closing a connection uses `shutdown()` then `close()` so the blocked receive thread wakes up.
+- **Tkinter is not thread-safe.** Network threads never touch widgets: they put events
+  into a `queue.Queue`, and the GUI thread drains the queue every 100 ms with
+  `root.after()`. Transfer progress is a shared variable that the GUI polls.
 
 ## Protocol
 Every JSON message is framed as:
@@ -112,11 +144,10 @@ Sender                                            Receiver
 - [x] Phase 4: multi-peer connection manager
 - [x] Phase 5: text messaging
 - [x] Phase 6: chunked file transfer
-- [ ] Phase 7: Tkinter GUI
+- [x] Phase 7: Tkinter GUI
 - [ ] Phase 8: error handling, final testing, screenshots
 
-## Running (development, command line)
-Self-tests:
+## Command-line Self-tests (development)
 ```
 python protocol.py
 python p2p_node.py selftest      # handshake and errors
@@ -124,14 +155,8 @@ python p2p_node.py selftest4     # multi-peer and simultaneous connect
 python p2p_node.py selftest5     # text messaging
 python p2p_node.py selftest6     # file transfer (SHA-256 verified)
 ```
-Two peers on one computer (two terminals):
-```
-python p2p_node.py node Alice 5000
-python p2p_node.py node Bob 5001 127.0.0.1 5000
-```
-Commands inside `node` mode: `peers`, `send <peer_id> <text>`, `broadcast <text>`,
-`sendfile <peer_id> <path>`, `disconnect <peer_id>`, `quit`.
-(Type the real peer ID without `<` `>`.)
+Headless peer: `python p2p_node.py node Alice 5000` (commands: `peers`, `send`, `broadcast`,
+`sendfile`, `disconnect`, `quit`; type the real peer ID without `<` `>`).
 
-## Running the GUI, connecting peers, transferring files, screenshots
-(TODO: Phase 7-8)
+## Screenshots
+(TODO: Phase 8)
