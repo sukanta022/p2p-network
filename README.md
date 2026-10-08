@@ -68,7 +68,7 @@ Initiator                              Acceptor
 - [x] Phase 1: message framing (`protocol.py`)
 - [x] Phase 2: TCP server and client
 - [x] Phase 3: HELLO handshake and peer tracking
-- [ ] Phase 4: multi-peer connection manager
+- [x] Phase 4: multi-peer connection manager
 - [ ] Phase 5: text messaging
 - [ ] Phase 6: chunked file transfer
 - [ ] Phase 7: Tkinter GUI

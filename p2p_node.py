@@ -1,4 +1,4 @@
-"""p2p_node.py - Core network engine (Phase 3: TCP server/client + HELLO handshake)."""
+"""p2p_node.py - Core network engine (Phase 4: handshake + multi-peer connection manager)."""
 import os
 import socket
 import sys
@@ -29,13 +29,15 @@ def validate_port(port) -> int:
     return port
 
 
-@dataclass(eq=False)                      # eq=False: compare peers by identity
+@dataclass(eq=False)                         # eq=False: compare peers by identity
 class Peer:
     peer_id: str
     name: str
     ip: str
-    port: int                             # the peer's LISTENING port (from hello)
+    port: int                                # the peer's LISTENING port (from hello)
     sock: socket.socket
+    initiated: bool = False                  # True if WE opened this connection
+    closed: bool = False                     # True once we deliberately close it
     send_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def label(self) -> str:
@@ -43,7 +45,8 @@ class Peer:
 
 
 class P2PNode:
-    def __init__(self, name: str, port, host: str = "0.0.0.0", on_event=None):
+    def __init__(self, name: str, port, host: str = "0.0.0.0",
+                 on_event=None, on_peers_changed=None):
         name = (name or "").strip()
         if not name:
             raise ValueError("Peer name cannot be empty")
@@ -51,12 +54,13 @@ class P2PNode:
         self.port = validate_port(port)
         self.host = host
         self.peer_id = uuid.uuid4().hex[:8]
-        self.on_event = on_event or print          # GUI will replace this later
+        self.on_event = on_event or print                      # GUI will replace this later
+        self.on_peers_changed = on_peers_changed or (lambda: None)
         self.server_socket = None
         self.running = False
         self._accept_thread = None
-        self.peers = {}                            # peer_id -> Peer
-        self._peers_lock = threading.Lock()        # protects self.peers
+        self.peers = {}                                        # peer_id -> Peer
+        self._peers_lock = threading.Lock()                    # protects self.peers
 
     def _log(self, text: str) -> None:
         self.on_event(f"[{self.name}] {text}")
@@ -130,11 +134,13 @@ class P2PNode:
             peers = list(self.peers.values())
             self.peers.clear()
         for p in peers:
+            p.closed = True
             self._close_socket(p.sock)
         t = self._accept_thread
         if t and t is not threading.current_thread():
             t.join(timeout=ACCEPT_POLL * 2)
         self._log("Stopped")
+        self._notify_peers_changed()
 
     # ---------- Client role ----------
 
@@ -175,7 +181,7 @@ class P2PNode:
             send_message(sock, make_hello(self.peer_id, self.name, self.port))
             ack = recv_message(sock)
             pid, name, rport = self._parse_handshake(ack, MSG_HELLO_ACK)
-            peer = Peer(pid, name, sock.getpeername()[0], rport, sock)
+            peer = Peer(pid, name, sock.getpeername()[0], rport, sock, initiated=True)
             if not self._register_peer(peer):
                 raise ProtocolError("already connected to this peer (or yourself)")
             sock.settimeout(None)
@@ -212,22 +218,51 @@ class P2PNode:
             raise ProtocolError("invalid port in handshake")
         return pid, name.strip()[:50], port
 
+    def _is_preferred(self, peer: Peer) -> bool:
+        """Tie-breaker when two connections exist between the same two peers:
+        keep the one initiated by the peer with the LOWER peer_id.
+        Both sides apply the same rule, so both keep the SAME connection."""
+        initiator_id = self.peer_id if peer.initiated else peer.peer_id
+        return initiator_id == min(self.peer_id, peer.peer_id)
+
     def _register_peer(self, peer: Peer) -> bool:
-        with self._peers_lock:                       # check + insert must be atomic
-            if peer.peer_id == self.peer_id or peer.peer_id in self.peers:
-                return False
+        if peer.peer_id == self.peer_id:
+            return False                                  # connecting to ourselves
+        old = None
+        with self._peers_lock:                            # check + insert/replace is atomic
+            existing = self.peers.get(peer.peer_id)
+            if existing is not None:
+                if self._is_preferred(peer) and not self._is_preferred(existing):
+                    old = existing                        # new one wins: replace old
+                else:
+                    return False                          # keep existing, reject new
             self.peers[peer.peer_id] = peer
-            return True
+        if old:                                           # close outside the lock
+            old.closed = True
+            self._close_socket(old.sock)
+            self._log(f"Duplicate connection with {peer.name} resolved")
+        self._notify_peers_changed()
+        return True
 
     def _remove_peer(self, peer: Peer) -> None:
+        peer.closed = True
         removed = False
         with self._peers_lock:
-            if self.peers.get(peer.peer_id) is peer:
+            if self.peers.get(peer.peer_id) is peer:      # only if THIS connection is registered
                 del self.peers[peer.peer_id]
                 removed = True
         self._close_socket(peer.sock)
-        if removed and self.running:
-            self._log(f"Peer disconnected: {peer.name} [{peer.peer_id}]")
+        if removed:
+            if self.running:
+                self._log(f"Peer disconnected: {peer.name} [{peer.peer_id}]")
+            self._notify_peers_changed()
+
+    def _notify_peers_changed(self) -> None:
+        # NOTE: runs on a network thread. The Tkinter GUI must hand over via root.after().
+        try:
+            self.on_peers_changed()
+        except Exception as e:
+            self._log(f"[ERROR] peers-changed callback failed: {e}")
 
     def _drop(self, peer, conn) -> None:
         """Cleanup after a failed handshake."""
@@ -250,6 +285,18 @@ class P2PNode:
         with self._peers_lock:
             return list(self.peers.values())
 
+    def get_peer(self, peer_id: str):
+        with self._peers_lock:
+            return self.peers.get(peer_id)
+
+    def disconnect_peer(self, peer_id: str) -> bool:
+        """Close the connection to one peer. Returns False if no such peer."""
+        peer = self.get_peer(peer_id)
+        if peer is None:
+            return False
+        self._remove_peer(peer)       # shutdown() wakes that peer's receive thread
+        return True
+
     # ---------- Receive loop (one thread per peer) ----------
 
     def _receive_loop(self, peer: Peer) -> None:
@@ -258,18 +305,18 @@ class P2PNode:
                 msg = recv_message(peer.sock)
                 self._dispatch(peer, msg)
         except ConnectionClosed:
-            pass                                  # normal disconnect
+            pass
         except ProtocolError as e:
-            if self.running:
+            if self.running and not peer.closed:
                 self._log(f"[ERROR] Protocol error from {peer.name}: {e}")
         except OSError as e:
-            if self.running:
+            if self.running and not peer.closed:
                 self._log(f"[ERROR] Socket error with {peer.name}: {e}")
         finally:
             self._remove_peer(peer)
 
     def _dispatch(self, peer: Peer, msg: dict) -> None:
-        """Phase 3 placeholder: text (Phase 5) and file (Phase 6) handling comes later."""
+        """Placeholder: text (Phase 5) and file (Phase 6) handling comes later."""
         self._log(f"{peer.name} sent '{msg.get('type')}' (not handled yet)")
 
 
@@ -321,13 +368,74 @@ def _selftest() -> None:
     alice.stop()
 
 
+def _selftest_multi() -> None:
+    a, b, c = P2PNode("A", 5100), P2PNode("B", 5101), P2PNode("C", 5102)
+    for n in (a, b, c):
+        n.start()
+    time.sleep(0.2)
+
+    def names(n):
+        return sorted(p.name for p in n.list_peers())
+
+    print("\n--- 1) Three peers, A->B, A->C, B->C ---")
+    a.connect_to_peer("127.0.0.1", 5101)
+    a.connect_to_peer("127.0.0.1", 5102)
+    b.connect_to_peer("127.0.0.1", 5102)
+    time.sleep(0.3)
+    for n in (a, b, c):
+        print(f"{n.name} peers:", names(n))
+
+    print("\n--- 2) Simultaneous connect D<->E (race) ---")
+    d, e = P2PNode("D", 5103), P2PNode("E", 5104)
+    d.start()
+    e.start()
+    time.sleep(0.2)
+    barrier = threading.Barrier(2)
+
+    def go(node, port):
+        barrier.wait()                       # both start at the same instant
+        try:
+            node.connect_to_peer("127.0.0.1", port)
+        except PeerConnectionError as err:
+            print(f"   ({node.name}) {err}")
+
+    ts = [threading.Thread(target=go, args=(d, 5104)),
+          threading.Thread(target=go, args=(e, 5103))]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    time.sleep(0.5)
+    print("D peers:", names(d), "| E peers:", names(e))
+    dp, ep = d.list_peers(), e.list_peers()
+    if dp and ep:
+        print("Same connection on both ends (initiated flags opposite):",
+              dp[0].initiated != ep[0].initiated)
+
+    print("\n--- 3) A disconnects one peer ---")
+    target = a.list_peers()[0]
+    a.disconnect_peer(target.peer_id)
+    time.sleep(0.4)
+    print("A peers:", names(a), "| B peers:", names(b), "| C peers:", names(c))
+
+    print("\n--- 4) B stops; others notice ---")
+    b.stop()
+    time.sleep(0.5)
+    print("A peers:", names(a), "| C peers:", names(c))
+    for n in (a, c, d, e):
+        n.stop()
+
+
 if __name__ == "__main__":
     usage = ("Usage:\n  python p2p_node.py selftest\n"
+             "  python p2p_node.py selftest4\n"
              "  python p2p_node.py node <name> <listen_port> [<remote_ip> <remote_port>]")
     if len(sys.argv) < 2:
         print(usage)
     elif sys.argv[1] == "selftest":
         _selftest()
+    elif sys.argv[1] == "selftest4":
+        _selftest_multi()
     elif sys.argv[1] == "node" and len(sys.argv) in (4, 6):
         try:
             node = P2PNode(sys.argv[2], sys.argv[3])
@@ -342,8 +450,19 @@ if __name__ == "__main__":
                 print(f"[ERROR] Connection failed: {e}")
         try:
             while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
+                cmd = input().strip().split()
+                if not cmd:
+                    continue
+                if cmd[0] == "peers":
+                    for p in node.list_peers():
+                        print("  ", p.label())
+                elif cmd[0] == "disconnect" and len(cmd) == 2:
+                    print("  ok" if node.disconnect_peer(cmd[1]) else "  no such peer")
+                elif cmd[0] == "quit":
+                    break
+                else:
+                    print("  commands: peers | disconnect <peer_id> | quit")
+        except (KeyboardInterrupt, EOFError):
             pass
         node.stop()
     else:
