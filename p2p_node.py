@@ -1,4 +1,4 @@
-"""p2p_node.py - Core network engine (Phase 4: handshake + multi-peer connection manager)."""
+"""p2p_node.py - Core network engine (Phase 5: handshake + multi-peer manager + text messaging)."""
 import os
 import socket
 import sys
@@ -7,16 +7,22 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from protocol import (MSG_HELLO, MSG_HELLO_ACK, ConnectionClosed, ProtocolError,
-                      make_hello, make_hello_ack, make_text, recv_message, send_message)
+from protocol import (MSG_FILE, MSG_HELLO, MSG_HELLO_ACK, MSG_TEXT, ConnectionClosed,
+                      ProtocolError, make_hello, make_hello_ack, make_text,
+                      recv_message, send_message)
 
 CONNECT_TIMEOUT = 5      # seconds for TCP connect()
 HANDSHAKE_TIMEOUT = 5    # seconds to complete hello/hello_ack
 ACCEPT_POLL = 1.0        # accept() wakes every second to check self.running
+MAX_TEXT_LENGTH = 10_000 # characters per text message
 
 
 class PeerConnectionError(Exception):
     """Raised when we cannot connect to a remote peer."""
+
+
+class SendError(Exception):
+    """Raised when a message cannot be sent."""
 
 
 def validate_port(port) -> int:
@@ -46,7 +52,7 @@ class Peer:
 
 class P2PNode:
     def __init__(self, name: str, port, host: str = "0.0.0.0",
-                 on_event=None, on_peers_changed=None):
+                 on_event=None, on_peers_changed=None, on_text_received=None):
         name = (name or "").strip()
         if not name:
             raise ValueError("Peer name cannot be empty")
@@ -56,6 +62,7 @@ class P2PNode:
         self.peer_id = uuid.uuid4().hex[:8]
         self.on_event = on_event or print                      # GUI will replace this later
         self.on_peers_changed = on_peers_changed or (lambda: None)
+        self.on_text_received = on_text_received or (lambda peer, text: None)
         self.server_socket = None
         self.running = False
         self._accept_thread = None
@@ -297,7 +304,47 @@ class P2PNode:
         self._remove_peer(peer)       # shutdown() wakes that peer's receive thread
         return True
 
-    # ---------- Receive loop (one thread per peer) ----------
+    # ---------- Sending (Phase 5) ----------
+
+    @staticmethod
+    def _check_text(text) -> None:
+        if not isinstance(text, str) or not text.strip():
+            raise SendError("Cannot send an empty message")
+        if len(text) > MAX_TEXT_LENGTH:
+            raise SendError(f"Message too long (max {MAX_TEXT_LENGTH} characters)")
+
+    def _send_to_peer(self, peer: Peer, message: dict) -> None:
+        """Send one framed message to one peer; send_lock keeps frames from interleaving."""
+        try:
+            with peer.send_lock:
+                send_message(peer.sock, message)
+        except ProtocolError as e:                  # e.g. message too large; nothing was sent
+            raise SendError(str(e)) from e
+        except OSError as e:                        # connection broken
+            self._remove_peer(peer)
+            raise SendError(f"Connection to {peer.name} lost: {e.strerror or e}") from e
+
+    def send_text(self, peer_id: str, text: str) -> None:
+        """Send a text message to ONE connected peer."""
+        self._check_text(text)
+        peer = self.get_peer(peer_id)
+        if peer is None:
+            raise SendError("Peer is not connected")
+        self._send_to_peer(peer, make_text(self.peer_id, self.name, text))
+
+    def broadcast_text(self, text: str) -> tuple:
+        """Send a text message to ALL connected peers. Returns (sent_count, failed_names)."""
+        self._check_text(text)
+        sent, failed = 0, []
+        for peer in self.list_peers():              # list_peers() returns a safe copy
+            try:
+                self._send_to_peer(peer, make_text(self.peer_id, self.name, text))
+                sent += 1
+            except SendError:
+                failed.append(peer.name)            # one bad peer must not stop the others
+        return sent, failed
+
+    # ---------- Receiving ----------
 
     def _receive_loop(self, peer: Peer) -> None:
         try:
@@ -316,8 +363,28 @@ class P2PNode:
             self._remove_peer(peer)
 
     def _dispatch(self, peer: Peer, msg: dict) -> None:
-        """Placeholder: text (Phase 5) and file (Phase 6) handling comes later."""
-        self._log(f"{peer.name} sent '{msg.get('type')}' (not handled yet)")
+        mtype = msg.get("type")
+        if mtype == MSG_TEXT:
+            self._handle_text(peer, msg)
+        elif mtype == MSG_FILE:
+            self._log(f"{peer.name} sent a file message (file transfer arrives in Phase 6)")
+        else:
+            self._log(f"[WARN] Ignoring unknown message type '{mtype}' from {peer.name}")
+
+    def _handle_text(self, peer: Peer, msg: dict) -> None:
+        text = msg.get("message")
+        if not isinstance(text, str) or not text.strip():
+            self._log(f"[WARN] Ignoring malformed text message from {peer.name}")
+            return
+        if len(text) > MAX_TEXT_LENGTH:
+            self._log(f"[WARN] Ignoring over-long text message from {peer.name}")
+            return
+        # Use the identity registered at handshake, not the sender_name inside the message.
+        self._log(f"{peer.name} [{peer.peer_id}]: {text}")
+        try:
+            self.on_text_received(peer, text)
+        except Exception as e:
+            self._log(f"[ERROR] text callback failed: {e}")
 
 
 # ---------- Manual / self tests ----------
@@ -426,9 +493,93 @@ def _selftest_multi() -> None:
         n.stop()
 
 
+def _selftest_text() -> None:
+    inbox = {"Alice": [], "Bob": [], "Carol": []}
+    inbox_lock = threading.Lock()
+
+    def collector(owner):
+        def callback(peer, text):
+            with inbox_lock:
+                inbox[owner].append((peer.name, text))
+        return callback
+
+    def texts(owner):
+        with inbox_lock:
+            return [t for _, t in inbox[owner]]
+
+    alice = P2PNode("Alice", 5200, on_text_received=collector("Alice"))
+    bob = P2PNode("Bob", 5201, on_text_received=collector("Bob"))
+    carol = P2PNode("Carol", 5202, on_text_received=collector("Carol"))
+    for n in (alice, bob, carol):
+        n.start()
+    time.sleep(0.2)
+    to_alice = bob.connect_to_peer("127.0.0.1", 5200)    # Bob's Peer object for Alice
+    carol.connect_to_peer("127.0.0.1", 5200)
+    time.sleep(0.3)
+
+    print("\n--- 1) Text in both directions (incl. Bengali) ---")
+    bob.send_text(to_alice.peer_id, "Hello Alice!")
+    alice.send_text(bob.peer_id, "Hi Bob! হ্যালো")
+    time.sleep(0.3)
+    print("Alice got:", texts("Alice"))
+    print("Bob got:  ", texts("Bob"))
+
+    print("\n--- 2) Order is preserved ---")
+    for i in range(1, 6):
+        bob.send_text(to_alice.peer_id, f"msg {i}")
+    time.sleep(0.3)
+    print("Alice got:", [t for t in texts("Alice") if t.startswith("msg")])
+
+    print("\n--- 3) Concurrent sends from 4 threads (send_lock) ---")
+    alice.on_event = lambda m: None                       # silence log during the burst
+    n_threads, per_thread = 4, 50
+    expected = {f"T{k}-{i}-" + "x" * 500 for k in range(n_threads) for i in range(per_thread)}
+
+    def burst(k):
+        for i in range(per_thread):
+            bob.send_text(to_alice.peer_id, f"T{k}-{i}-" + "x" * 500)
+
+    workers = [threading.Thread(target=burst, args=(k,)) for k in range(n_threads)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    time.sleep(1.0)
+    alice.on_event = print
+    got = [t for t in texts("Alice") if t.startswith("T")]
+    print(f"Received {len(got)}/{len(expected)} messages; all intact: {set(got) == expected}")
+
+    print("\n--- 4) Send errors ---")
+    for pid, text in [("nonexistent", "hi"), (to_alice.peer_id, "   "),
+                      (to_alice.peer_id, "x" * (MAX_TEXT_LENGTH + 1))]:
+        try:
+            bob.send_text(pid, text)
+        except SendError as e:
+            print("[ERROR] Send failed:", e)
+
+    print("\n--- 5) Broadcast: Alice -> Bob and Carol ---")
+    sent, failed = alice.broadcast_text("Hello everyone")
+    time.sleep(0.3)
+    print(f"Sent to {sent} peers, failed: {failed}")
+    print("Bob:", texts("Bob")[-1], "| Carol:", texts("Carol")[-1])
+
+    print("\n--- 6) Malformed / unknown messages do not crash the receiver ---")
+    raw = socket.create_connection(("127.0.0.1", 5200))
+    send_message(raw, make_hello("cafebabe", "Mallory", 5999))
+    print("   ack type:", recv_message(raw)["type"])
+    send_message(raw, {"type": "text"})                   # missing 'message'
+    send_message(raw, {"type": "banana"})                 # unknown type
+    send_message(raw, make_text("cafebabe", "Mallory", "I am still connected"))
+    time.sleep(0.3)
+    raw.close()
+    time.sleep(0.3)
+
+    for n in (alice, bob, carol):
+        n.stop()
+
+
 if __name__ == "__main__":
-    usage = ("Usage:\n  python p2p_node.py selftest\n"
-             "  python p2p_node.py selftest4\n"
+    usage = ("Usage:\n  python p2p_node.py selftest | selftest4 | selftest5\n"
              "  python p2p_node.py node <name> <listen_port> [<remote_ip> <remote_port>]")
     if len(sys.argv) < 2:
         print(usage)
@@ -436,6 +587,8 @@ if __name__ == "__main__":
         _selftest()
     elif sys.argv[1] == "selftest4":
         _selftest_multi()
+    elif sys.argv[1] == "selftest5":
+        _selftest_text()
     elif sys.argv[1] == "node" and len(sys.argv) in (4, 6):
         try:
             node = P2PNode(sys.argv[2], sys.argv[3])
@@ -448,20 +601,32 @@ if __name__ == "__main__":
                 node.connect_to_peer(sys.argv[4], sys.argv[5])
             except PeerConnectionError as e:
                 print(f"[ERROR] Connection failed: {e}")
+        help_text = ("  commands: peers | send <peer_id> <text> | broadcast <text> | "
+                     "disconnect <peer_id> | quit")
         try:
             while True:
-                cmd = input().strip().split()
+                parts = input().strip().split(maxsplit=2)
+                cmd = parts[0].lower() if parts else ""
                 if not cmd:
                     continue
-                if cmd[0] == "peers":
-                    for p in node.list_peers():
-                        print("  ", p.label())
-                elif cmd[0] == "disconnect" and len(cmd) == 2:
-                    print("  ok" if node.disconnect_peer(cmd[1]) else "  no such peer")
-                elif cmd[0] == "quit":
-                    break
-                else:
-                    print("  commands: peers | disconnect <peer_id> | quit")
+                try:
+                    if cmd == "peers":
+                        for p in node.list_peers():
+                            print("  ", p.label())
+                    elif cmd == "send" and len(parts) == 3:
+                        node.send_text(parts[1], parts[2])
+                    elif cmd == "broadcast" and len(parts) >= 2:
+                        text = " ".join(parts[1:])
+                        sent, failed = node.broadcast_text(text)
+                        print(f"  sent to {sent} peer(s)" + (f", failed: {failed}" if failed else ""))
+                    elif cmd == "disconnect" and len(parts) == 2:
+                        print("  ok" if node.disconnect_peer(parts[1]) else "  no such peer")
+                    elif cmd == "quit":
+                        break
+                    else:
+                        print(help_text)
+                except SendError as e:
+                    print(f"[ERROR] Send failed: {e}")
         except (KeyboardInterrupt, EOFError):
             pass
         node.stop()
