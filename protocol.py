@@ -1,4 +1,4 @@
-"""protocol.py - Application-level protocol: framing + message builders."""
+"""protocol.py - Application-level protocol: framing, message builders, file chunk helpers."""
 import json
 import socket
 import struct
@@ -6,7 +6,8 @@ import struct
 HEADER_SIZE = 4
 HEADER_FORMAT = ">I"                 # big-endian unsigned 32-bit int
 MAX_MESSAGE_SIZE = 1 * 1024 * 1024   # sanity limit for JSON messages (1 MB)
-CHUNK_SIZE = 64 * 1024               # used for file transfer (Phase 6)
+CHUNK_SIZE = 64 * 1024               # file transfer chunk size (64 KB)
+MAX_FILE_SIZE = 4 * 1024 ** 3        # sanity limit for a single file (4 GB)
 
 MSG_HELLO = "hello"
 MSG_HELLO_ACK = "hello_ack"
@@ -80,9 +81,51 @@ def make_file_meta(sender_id: str, sender_name: str, filename: str, filesize: in
             "filename": filename, "filesize": filesize}
 
 
+# ---------- File chunk helpers (raw bytes, NOT framed) ----------
+
+def send_file_bytes(sock: socket.socket, fileobj, filesize: int, on_progress=None) -> None:
+    """Send exactly `filesize` raw bytes from fileobj, CHUNK_SIZE bytes at a time."""
+    sent = 0
+    while sent < filesize:
+        chunk = fileobj.read(min(CHUNK_SIZE, filesize - sent))
+        if not chunk:
+            raise ProtocolError("File ended early (it changed while sending)")
+        sock.sendall(chunk)
+        sent += len(chunk)
+        if on_progress:
+            on_progress(sent, filesize)
+
+
+def recv_file_bytes(sock: socket.socket, filesize: int, out_file=None, on_progress=None):
+    """Read exactly `filesize` raw bytes from sock, never one byte more.
+
+    Bytes are written to out_file (pass None to discard them). If writing fails
+    (e.g. disk full) we keep reading and discarding so the stream stays in sync,
+    and return that OSError. Returns None on complete success.
+    Raises ConnectionClosed if the peer disconnects early.
+    """
+    received = 0
+    write_error = None
+    while received < filesize:
+        chunk = sock.recv(min(CHUNK_SIZE, filesize - received))
+        if not chunk:
+            raise ConnectionClosed(f"connection closed after {received} of {filesize} bytes")
+        if out_file is not None and write_error is None:
+            try:
+                out_file.write(chunk)
+            except OSError as e:
+                write_error = e
+        received += len(chunk)
+        if on_progress:
+            on_progress(received, filesize)
+    return write_error
+
+
 # ---------- Self-test: python protocol.py ----------
 
 if __name__ == "__main__":
+    import io
+    import os
     import threading
     import time
 
@@ -125,3 +168,23 @@ if __name__ == "__main__":
         recv_message(d)
     except ProtocolError as e:
         print("   ProtocolError:", e)
+
+    print("6) File bytes between two framed messages (200,000 bytes = 3 full chunks + remainder):")
+    e, f = socket.socketpair()
+    data = os.urandom(200_000)
+
+    def file_sender():
+        send_message(e, make_file_meta("a83f21c4", "Alice", "demo.bin", len(data)))
+        send_file_bytes(e, io.BytesIO(data), len(data))
+        send_message(e, make_text("a83f21c4", "Alice", "text after the file"))
+
+    t = threading.Thread(target=file_sender)
+    t.start()
+    meta = recv_message(f)
+    out = io.BytesIO()
+    err = recv_file_bytes(f, meta["filesize"], out)
+    nxt = recv_message(f)
+    t.join()
+    print("   metadata:", meta["filename"], meta["filesize"])
+    print("   bytes identical:", out.getvalue() == data, "| write error:", err)
+    print("   next message still intact:", nxt["message"])
