@@ -59,8 +59,8 @@ saved as `name (1).ext`; nothing is overwritten.
 | | |
 |---|---|
 | ![Peer started](screenshots/01_peer_started.png) | ![Two peers connected](screenshots/02_two_peers_connected.png) |
-| ![Text messages](screenshots/03_text_messages.jpeg) | ![File transfer](screenshots/04_file_transfer.png) |
-| ![Downloads folder](screenshots/05_downloads_folder.jpeg) | ![Three peers](screenshots/06_three_peers.png) |
+| ![Text messages](screenshots/03_text_messages.jpeg) | ![File transfer](screenshots/04_file_transfer.jpeg) |
+| ![Downloads folder](screenshots/05_downloads_folder.png) | ![Three peers](screenshots/06_three_peers.png) |
 
 ## Project Structure
 | File | Responsibility |
