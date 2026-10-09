@@ -1,4 +1,5 @@
-"""p2p_node.py - Core network engine (Phase 6: handshake, multi-peer, text, chunked file transfer)."""
+"""p2p_node.py - Core network engine (Phase 8 final: handshake, multi-peer, text,
+chunked file transfer, hardened error handling)."""
 import os
 import re
 import socket
@@ -20,6 +21,7 @@ MAX_TEXT_LENGTH = 10_000 # characters per text message
 DEFAULT_DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
 
 _INVALID_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL",
                    *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
@@ -69,6 +71,21 @@ def sanitize_filename(name) -> str:
     return name
 
 
+def enable_keepalive(sock: socket.socket) -> None:
+    """Ask the OS to probe idle connections, so a peer that vanished without
+    closing (Wi-Fi lost, cable pulled, crash) is detected in ~20-40 s, not hours."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "SIO_KEEPALIVE_VALS"):                    # Windows
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 10_000, 3_000))  # on, idle 10 s, probe every 3 s
+        else:                                                        # Linux (macOS lacks some of these)
+            for opt, value in (("TCP_KEEPIDLE", 10), ("TCP_KEEPINTVL", 3), ("TCP_KEEPCNT", 3)):
+                if hasattr(socket, opt):
+                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), value)
+    except OSError:
+        pass                                                         # keepalive is best-effort
+
+
 @dataclass(eq=False)                         # eq=False: compare peers by identity
 class Peer:
     peer_id: str
@@ -96,7 +113,7 @@ class P2PNode:
         self.host = host
         self.peer_id = uuid.uuid4().hex[:8]
         self.download_dir = download_dir or DEFAULT_DOWNLOAD_DIR
-        self.on_event = on_event or print                      # GUI will replace this later
+        self.on_event = on_event or print                      # GUI replaces this
         self.on_peers_changed = on_peers_changed or (lambda: None)
         self.on_text_received = on_text_received or (lambda peer, text: None)
         self.on_file_received = on_file_received or (lambda peer, path: None)
@@ -140,6 +157,7 @@ class P2PNode:
                 continue
             except OSError:
                 break
+            enable_keepalive(conn)
             self._log(f"Incoming connection from {addr[0]}:{addr[1]}")
             threading.Thread(target=self._handle_incoming,
                              args=(conn, addr), daemon=True).start()
@@ -162,6 +180,10 @@ class P2PNode:
             return
         except (ProtocolError, OSError) as e:
             self._log(f"[ERROR] Handshake with {addr[0]}:{addr[1]} failed: {e}")
+            self._drop(peer, conn)
+            return
+        except Exception as e:                      # never let a bug kill the thread silently
+            self._log(f"[ERROR] Unexpected handshake error from {addr[0]}:{addr[1]}: {e}")
             self._drop(peer, conn)
             return
         self._log(f"Peer connected: {peer.label()}")
@@ -190,7 +212,7 @@ class P2PNode:
     # ---------- Client role ----------
 
     def _tcp_connect(self, ip: str, port) -> socket.socket:
-        """Plain TCP connect with validation and friendly errors (Phase 2)."""
+        """Plain TCP connect with validation and friendly errors."""
         try:
             port = validate_port(port)
         except ValueError as e:
@@ -214,12 +236,36 @@ class P2PNode:
         except OSError as e:
             sock.close()
             raise PeerConnectionError(e.strerror or str(e)) from e
+        enable_keepalive(sock)
         return sock
+
+    def _is_own_address(self, ip: str, port: int) -> bool:
+        """True if ip:port points at THIS peer (so connecting would be to ourselves)."""
+        if port != self.port:
+            return False
+        if ip.lower() == "localhost" or ip.startswith("127.") or ip in ("0.0.0.0", "::1"):
+            return True
+        try:
+            return ip in socket.gethostbyname_ex(socket.gethostname())[2]
+        except OSError:
+            return False
 
     def connect_to_peer(self, ip: str, port) -> Peer:
         """Initiator side: TCP connect, send hello, wait for hello_ack, register."""
         if not self.running:
             raise PeerConnectionError("Start your peer before connecting")
+        ip = str(ip).strip()
+        try:
+            port = validate_port(port)
+        except ValueError as e:
+            raise PeerConnectionError(str(e)) from e
+        if self._is_own_address(ip, port):
+            raise PeerConnectionError("You cannot connect to yourself")
+        for existing in self.list_peers():
+            if existing.ip == ip and existing.port == port:
+                raise PeerConnectionError(
+                    f"Already connected to {existing.name} [{existing.peer_id}]")
+
         sock = self._tcp_connect(ip, port)
         try:
             sock.settimeout(HANDSHAKE_TIMEOUT)
@@ -255,13 +301,16 @@ class P2PNode:
         if msg.get("type") != expected_type:
             raise ProtocolError(f"expected '{expected_type}', got '{msg.get('type')}'")
         pid, name, port = msg.get("peer_id"), msg.get("peer_name"), msg.get("port")
-        if not isinstance(pid, str) or not pid or not isinstance(name, str) or not name.strip():
+        if not isinstance(pid, str) or not pid or not isinstance(name, str):
+            raise ProtocolError("malformed handshake")
+        name = _CONTROL_CHARS.sub("", name).strip()[:50]     # no newlines / control chars in names
+        if not name:
             raise ProtocolError("malformed handshake")
         try:
             port = validate_port(port)
         except ValueError:
             raise ProtocolError("invalid port in handshake")
-        return pid, name.strip()[:50], port
+        return pid, name, port
 
     def _is_preferred(self, peer: Peer) -> bool:
         """Tie-breaker when two connections exist between the same two peers:
@@ -303,7 +352,7 @@ class P2PNode:
             self._notify_peers_changed()
 
     def _notify_peers_changed(self) -> None:
-        # NOTE: runs on a network thread. The Tkinter GUI must hand over via root.after().
+        # NOTE: runs on a network thread. The GUI hands the event over via a queue.
         try:
             self.on_peers_changed()
         except Exception as e:
@@ -440,13 +489,18 @@ class P2PNode:
                 msg = recv_message(peer.sock)
                 self._dispatch(peer, msg)
         except ConnectionClosed:
-            pass
+            pass                                    # normal disconnect
+        except (ConnectionResetError, ConnectionAbortedError):
+            pass                                    # peer vanished abruptly; _remove_peer logs it
         except ProtocolError as e:
             if self.running and not peer.closed:
                 self._log(f"[ERROR] Protocol error from {peer.name}: {e}")
         except OSError as e:
             if self.running and not peer.closed:
                 self._log(f"[ERROR] Socket error with {peer.name}: {e}")
+        except Exception as e:                      # a bug must not crash the whole app
+            if self.running and not peer.closed:
+                self._log(f"[ERROR] Unexpected error with {peer.name}: {e}")
         finally:
             self._remove_peer(peer)
 
@@ -519,7 +573,8 @@ class P2PNode:
                                           self._progress_cb("receive", filename))
             complete = True
         except (ConnectionClosed, OSError) as e:
-            self._log(f"[ERROR] Transfer of '{filename}' from {peer.name} interrupted: {e}")
+            if self.running and not peer.closed:
+                self._log(f"[ERROR] Transfer of '{filename}' from {peer.name} interrupted: {e}")
             raise
         finally:
             if out is not None:
@@ -559,13 +614,13 @@ def _selftest() -> None:
     print("Alice's peers:", [p.label() for p in alice.list_peers()])
     print("Bob's peers:  ", [p.label() for p in bob.list_peers()])
 
-    print("\n--- 2) Duplicate connection ---")
+    print("\n--- 2) Already connected (friendly pre-check) ---")
     try:
         bob.connect_to_peer("127.0.0.1", 5000)
     except PeerConnectionError as e:
         print("[ERROR] Connection failed:", e)
 
-    print("\n--- 3) Connecting to yourself ---")
+    print("\n--- 3) Connecting to yourself (friendly pre-check) ---")
     try:
         alice.connect_to_peer("127.0.0.1", 5000)
     except PeerConnectionError as e:
@@ -870,8 +925,96 @@ def _selftest_file() -> None:
     shutil.rmtree(work, ignore_errors=True)
 
 
+def _selftest_edge() -> None:
+    import shutil
+    import struct
+    import tempfile
+
+    work = tempfile.mkdtemp(prefix="p2p_edge_")
+    dst = os.path.join(work, "downloads")
+    received = []
+    calls = {"n": 0}
+
+    def flaky_callback(peer, text):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated GUI bug")
+        received.append(text)
+
+    alice = P2PNode("Alice", 5400, download_dir=dst, on_text_received=flaky_callback)
+    bob = P2PNode("Bob", 5401)
+    alice.start()
+    bob.start()
+    time.sleep(0.2)
+
+    def raw_peer(pid, name):
+        s = socket.create_connection(("127.0.0.1", 5400))
+        send_message(s, make_hello(pid, name, 5999))
+        recv_message(s)
+        return s
+
+    print("\n--- 1) Connecting to yourself, in several spellings ---")
+    for ip in ("127.0.0.1", "localhost", "0.0.0.0"):
+        try:
+            alice.connect_to_peer(ip, 5400)
+        except PeerConnectionError as e:
+            print(f"RESULT {ip}: {e}")
+
+    print("\n--- 2) Already connected ---")
+    to_alice = bob.connect_to_peer("127.0.0.1", 5400)
+    time.sleep(0.2)
+    try:
+        bob.connect_to_peer("127.0.0.1", 5400)
+    except PeerConnectionError as e:
+        print("RESULT", e)
+
+    print("\n--- 3) TCP keepalive enabled ---")
+    on = to_alice.sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) != 0
+    print("RESULT keepalive on:", on)
+
+    print("\n--- 4) A failing callback does not kill the receive loop ---")
+    bob.send_text(to_alice.peer_id, "first (callback raises)")
+    bob.send_text(to_alice.peer_id, "second")
+    time.sleep(0.4)
+    print("RESULT second message delivered:", received == ["second"])
+
+    print("\n--- 5) Control characters in peer names are removed ---")
+    eve = socket.create_connection(("127.0.0.1", 5400))
+    send_message(eve, make_hello("e1e1e1e1", "Eve\r\n[Alice] FAKE LINE", 5999))
+    recv_message(eve)
+    time.sleep(0.2)
+    names = [p.name for p in alice.list_peers()]
+    print("RESULT peer names:", names)
+    print("RESULT no newline in any name:", all("\n" not in n and "\r" not in n for n in names))
+
+    print("\n--- 6) Abrupt connection reset (RST) is handled quietly ---")
+    try:
+        fmt = "hh" if os.name == "nt" else "ii"
+        eve.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack(fmt, 1, 0))
+    except OSError:
+        print("   (could not set SO_LINGER on this system; closing normally)")
+    eve.close()
+    time.sleep(0.6)
+    print("RESULT peers left:", sorted(p.name for p in alice.list_peers()))
+
+    print("\n--- 7) stop() while a big file is arriving ---")
+    carol = raw_peer("c0c0c0c0", "Carol")
+    send_message(carol, make_file_meta("c0c0c0c0", "Carol", "huge.bin", 500_000_000))
+    carol.sendall(os.urandom(2 * 1024 * 1024))
+    time.sleep(0.4)
+    t0 = time.time()
+    alice.stop()
+    elapsed = time.time() - t0
+    time.sleep(0.5)
+    print(f"RESULT stop() took {elapsed:.1f}s; partial file removed: "
+          f"{not os.path.exists(os.path.join(dst, 'huge.bin'))}")
+    carol.close()
+    bob.stop()
+    shutil.rmtree(work, ignore_errors=True)
+
+
 if __name__ == "__main__":
-    usage = ("Usage:\n  python p2p_node.py selftest | selftest4 | selftest5 | selftest6\n"
+    usage = ("Usage:\n  python p2p_node.py selftest | selftest4 | selftest5 | selftest6 | selftest8\n"
              "  python p2p_node.py node <name> <listen_port> [<remote_ip> <remote_port>]")
     if len(sys.argv) < 2:
         print(usage)
@@ -883,6 +1026,8 @@ if __name__ == "__main__":
         _selftest_text()
     elif sys.argv[1] == "selftest6":
         _selftest_file()
+    elif sys.argv[1] == "selftest8":
+        _selftest_edge()
     elif sys.argv[1] == "node" and len(sys.argv) in (4, 6):
         try:
             node = P2PNode(sys.argv[2], sys.argv[3])
